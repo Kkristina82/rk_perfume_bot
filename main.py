@@ -2,6 +2,9 @@ import asyncio
 import os
 import json
 import logging
+import http.server
+import socketserver
+import threading
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
@@ -15,10 +18,10 @@ from yt_dlp import YoutubeDL
 # ============================================================
 # НАЛАШТУВАННЯ
 # ============================================================
-TOKEN = os.getenv("BOT_TOKEN", "8700486318:AAHnhE4UNKwQKPGT0ZlW-VPfX906z95heCE")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7443699603"))
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@rkperfume")
-TIKTOK_USER = "rk.perfume.krop"
+TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+TIKTOK_USER = os.getenv("TIKTOK_USER", "rk.perfume.krop")
 
 CONFIG_FILE = "perfume_config.json"
 ORDERS_FILE = "orders.json"
@@ -35,6 +38,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN не знайдено! Перевірте змінні середовища.")
+if not ADMIN_ID:
+    raise ValueError("❌ ADMIN_ID не знайдено! Перевірте змінні середовища.")
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
@@ -114,7 +122,8 @@ def save_orders(orders: list):
 def add_order(user_id: int, username: str, order_type: str, items: list, notes: str = "") -> dict:
     """Додає нове замовлення"""
     orders = load_orders()
-    order_id = len(orders) + 1
+    # Знаходимо максимальний ID щоб уникнути дублювання після видалення замовлень
+    order_id = max((o["id"] for o in orders), default=0) + 1
     
     order = {
         "id": order_id,
@@ -203,7 +212,7 @@ async def download_tiktok_video(post: dict) -> dict:
             title = info.get("description", info.get("title", post["title"]))
             return {**post, "filename": filename, "title": title[:300] if title else post["title"]}
     except Exception as e:
-        logger.warning(f"Не вдалося завантажити TikTok видео {post['id']}: {e}")
+        logger.warning(f"Не вдалося завантажити TikTok відео {post['id']}: {e}")
         return {**post, "filename": None}
 
 def make_tiktok_caption(post: dict) -> str:
@@ -216,7 +225,10 @@ def make_tiktok_caption(post: dict) -> str:
     return caption
 
 async def publish_tiktok_post(post_info: dict) -> bool:
-    """Публікує TikTok видео у канал"""
+    """Публікує TikTok відео у канал"""
+    if not CHANNEL_ID:
+        logger.warning("CHANNEL_ID не встановлено, пропускаю публікацію")
+        return False
     caption = make_tiktok_caption(post_info)
     filename = post_info.get("filename")
     try:
@@ -236,18 +248,18 @@ async def publish_tiktok_post(post_info: dict) -> bool:
             )
         return True
     except Exception as e:
-        logger.error(f"Помилка публікації TikTok видео {post_info['id']}: {e}")
+        logger.error(f"Помилка публікації TikTok відео {post_info['id']}: {e}")
         return False
     finally:
         if filename and os.path.exists(filename):
             os.remove(filename)
 
 async def run_tiktok_sync(notify_admin: bool = False) -> int:
-    """Перевіряє та публікує нові TikTok видео"""
+    """Перевіряє та публікує нові TikTok відео"""
     global tiktok_state
     tiktok_count = 0
 
-    logger.info("Починаю перевірку нових TikTok видео...")
+    logger.info("Починаю перевірку нових TikTok відео...")
 
     try:
         new_tiktok = await get_new_tiktok_posts()
@@ -327,7 +339,7 @@ def order_action_keyboard(order_id: int) -> InlineKeyboardMarkup:
 # ФОРМАТУВАННЯ ПОВІДОМЛЕНЬ
 # ============================================================
 def format_price_list(config: dict) -> str:
-    """Форматує прайс як красиву таблицю"""
+    """Форматує прайс як красивий список"""
     perfumes = config["perfumes"]
     
     if not perfumes:
@@ -335,7 +347,7 @@ def format_price_list(config: dict) -> str:
     
     text = "✨ <b>🌸 ПРАЙС ПАРФУМІВ 🌸</b> ✨\n\n"
     
-    for idx, perfume in enumerate(perfumes, 1):
+    for perfume in perfumes:
         text += f"<b>🔹 {perfume['name']}</b>\n"
         text += f"   <i>{perfume.get('description', '')}</i>\n"
         text += f"   💵 <code>{perfume['price']} грн</code>\n\n"
@@ -358,7 +370,7 @@ def format_order_details(order: dict) -> str:
     
     if order['type'] == 'custom':
         text += f"<b>✍️ Запит:</b>\n<code>{order['items'][0]}</code>\n"
-        if order['notes']:
+        if order.get('notes'):
             text += f"\n<b>📝 Додатково:</b>\n<code>{order['notes']}</code>\n"
     else:
         text += "<b>🌸 Парфуми:</b>\n"
@@ -373,14 +385,11 @@ def format_order_details(order: dict) -> str:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     """Стартова команда"""
-    config = load_config()
-    
     welcome_text = (
         "👋 <b>Добро пожалувати в наш магазин парфумів!</b> 🌸\n\n"
         "✨ <i>RK Perfume</i> — це якісні та приємні запахи для вас!\n\n"
         "Виберіть що вас цікавить:"
     )
-    
     await message.answer(welcome_text, reply_markup=main_keyboard(), parse_mode=ParseMode.HTML)
     await state.clear()
 
@@ -418,8 +427,8 @@ async def process_custom_order(message: types.Message, state: FSMContext):
     
     await message.answer(
         "✨ Спасибі! Ваш запит записано.\n\n"
-        "📞 Хочете щоб ми з вами звʼязались або додати що-небудь ще?\n\n"
-        "<i>Напишіть контактні дані, номер телефону або повідомте якщо це не потрібно (\"нi\" або \"-\")</i>",
+        "📞 Хочете щоб ми з вами зв'язались або додати що-небудь ще?\n\n"
+        "<i>Напишіть контактні дані, номер телефону або повідомте якщо це не потрібно (\"ні\" або \"-\")</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -428,11 +437,11 @@ async def finalize_custom_order(message: types.Message, state: FSMContext):
     """Завершує індивідуальне замовлення"""
     data = await state.get_data()
     
-    notes = message.text if message.text not in ["нi", "-", "не"] else ""
+    notes = "" if message.text in ["ні", "-", "не", "нi", "no"] else (message.text or "")
     
     order = add_order(
         user_id=message.from_user.id,
-        username=message.from_user.username or "unknown",
+        username=message.from_user.username or str(message.from_user.id),
         order_type="custom",
         items=[data["order_text"]],
         notes=notes
@@ -470,7 +479,6 @@ async def cmd_admin(message: types.Message, state: FSMContext):
         await message.answer("❌ У вас немає прав доступу!")
         return
     
-    config = load_config()
     await state.set_state(OrderStates.admin_waiting_for_password)
     await message.answer(
         "🔐 <b>Адміністраторський вхід</b>\n\n"
@@ -509,7 +517,6 @@ async def show_orders(message: types.Message, state: FSMContext):
         await message.answer("📭 <b>Замовлень немає</b>", parse_mode=ParseMode.HTML)
         return
     
-    # Групуємо по статусу
     pending = [o for o in orders if o["status"] == "pending"]
     confirmed = [o for o in orders if o["status"] == "confirmed"]
     completed = [o for o in orders if o["status"] == "completed"]
@@ -518,22 +525,23 @@ async def show_orders(message: types.Message, state: FSMContext):
     
     if pending:
         text += f"⏳ <b>На розгляді ({len(pending)}):</b>\n"
-        for o in pending[-3:]:  # останні 3
+        for o in pending[-5:]:
             text += f"  • #{o['id']} - @{o['username']}\n"
         text += "\n"
     
     if confirmed:
         text += f"✅ <b>Підтверджені ({len(confirmed)}):</b>\n"
-        for o in confirmed[-3:]:
+        for o in confirmed[-5:]:
             text += f"  • #{o['id']} - @{o['username']}\n"
         text += "\n"
     
     if completed:
         text += f"🎁 <b>Виконані ({len(completed)}):</b>\n"
-        for o in completed[-3:]:
+        for o in completed[-5:]:
             text += f"  • #{o['id']} - @{o['username']}\n"
     
-    text += "\n<i>Щоб переглянути деталі замовлення, напишіть номер (приклад: #1)</i>"
+    text += f"\n📈 <b>Всього замовлень:</b> {len(orders)}"
+    text += "\n\n<i>Щоб переглянути деталі, напишіть номер (приклад: #1)</i>"
     
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -544,7 +552,7 @@ async def show_order_details(message: types.Message, state: FSMContext):
         return
     
     try:
-        order_id = int(message.text.strip("#"))
+        order_id = int(message.text.strip("#").strip())
         orders = load_orders()
         order = next((o for o in orders if o["id"] == order_id), None)
         
@@ -579,12 +587,11 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
         
         config = load_config()
         
-        # Повідомлення користувачу з картою
         user_message = (
             f"✅ <b>Ваше замовлення #{order['id']} підтверджено!</b>\n\n"
             f"💳 <b>Реквізити для передоплати:</b>\n\n"
             f"<code>{config['card']}</code>\n"
-            f"<b>На ім'я:</b> {config['card_holder']}\n\n"
+            f"На ім'я: <b>{config['card_holder']}</b>\n\n"
             f"📝 Після передоплати напишіть нам, і ми почнемо готувати ваше замовлення! 🎁"
         )
         
@@ -630,6 +637,15 @@ async def manage_price(message: types.Message, state: FSMContext):
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=price_action_keyboard())
 
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin(callback: types.CallbackQuery, state: FSMContext):
+    """Повернення до адмін панелі"""
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(OrderStates.admin_panel)
+    await callback.message.answer("🔙 Повернення до панелі:", reply_markup=admin_keyboard())
+    await callback.answer()
+
 @dp.callback_query(F.data == "add_perfume")
 async def add_perfume_start(callback: types.CallbackQuery, state: FSMContext):
     """Розпочинає додавання парфума"""
@@ -656,7 +672,7 @@ async def add_perfume_name(message: types.Message, state: FSMContext):
 async def add_perfume_price(message: types.Message, state: FSMContext):
     """Отримує ціну парфума"""
     try:
-        price = int(message.text)
+        price = int(message.text.strip())
     except ValueError:
         await message.answer("❌ Будь ласка напишіть число!")
         return
@@ -690,7 +706,7 @@ async def add_perfume_description(message: types.Message, state: FSMContext):
     )
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
-    await state.clear()
+    await state.set_state(OrderStates.admin_panel)
 
 @dp.callback_query(F.data == "delete_perfume")
 async def delete_perfume_start(callback: types.CallbackQuery, state: FSMContext):
@@ -699,6 +715,10 @@ async def delete_perfume_start(callback: types.CallbackQuery, state: FSMContext)
         return
     
     config = load_config()
+    if not config["perfumes"]:
+        await callback.answer("Прайс порожній!", show_alert=True)
+        return
+
     text = "<b>❌ Видалення парфума</b>\n\n"
     text += "Парфуми:\n"
     for p in config["perfumes"]:
@@ -714,7 +734,7 @@ async def delete_perfume_start(callback: types.CallbackQuery, state: FSMContext)
 async def delete_perfume(message: types.Message, state: FSMContext):
     """Видаляє парфум"""
     try:
-        perfume_id = int(message.text)
+        perfume_id = int(message.text.strip())
     except ValueError:
         await message.answer("❌ Напишіть число!")
         return
@@ -734,23 +754,22 @@ async def delete_perfume(message: types.Message, state: FSMContext):
         parse_mode=ParseMode.HTML,
         reply_markup=admin_keyboard()
     )
-    await state.clear()
+    await state.set_state(OrderStates.admin_panel)
 
 @dp.callback_query(F.data == "edit_perfume")
 async def edit_perfume_start(callback: types.CallbackQuery, state: FSMContext):
-    """Розпочинає редагування парфума"""
+    """Редагування: видали + додай знову"""
     if callback.from_user.id != ADMIN_ID:
         return
     
-    config = load_config()
-    text = "<b>✏️ Редагування парфума</b>\n\n"
-    for p in config["perfumes"]:
-        text += f"ID: <code>{p['id']}</code> - {p['name']}\n"
-    
-    text += "\n📝 Напишіть ID парфума:"
-    
-    await state.set_state(OrderStates.admin_waiting_for_delete_id)
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove())
+    await callback.message.answer(
+        "✏️ <b>Редагування парфума</b>\n\n"
+        "Щоб редагувати парфум:\n"
+        "1. Видаліть старий (кнопка ❌ Видалити)\n"
+        "2. Додайте новий з оновленими даними (➕ Додати парфум)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_keyboard()
+    )
     await callback.answer()
 
 @dp.message(F.text == "💳 Налаштування карти")
@@ -765,7 +784,7 @@ async def setup_card(message: types.Message, state: FSMContext):
         "💳 <b>НАЛАШТУВАННЯ КАРТИ</b>\n\n"
         f"<b>Поточні реквізити:</b>\n"
         f"<code>{config['card']}</code>\n"
-        f"<b>На ім'я:</b> {config['card_holder']}\n\n"
+        f"На ім'я: <b>{config['card_holder']}</b>\n\n"
         "Напишіть новий номер карти:"
     )
     
@@ -777,7 +796,7 @@ async def set_card_number(message: types.Message, state: FSMContext):
     """Встановлює номер карти"""
     await state.update_data(card=message.text)
     await state.set_state(OrderStates.admin_waiting_for_card_holder)
-    await message.answer("👤 Напишіть ім'я власника карти:")
+    await message.answer("👤 Напишіть ім'я власника карти (ВЕЛИКИМИ БУКВАМИ):")
 
 @dp.message(OrderStates.admin_waiting_for_card_holder)
 async def set_card_holder(message: types.Message, state: FSMContext):
@@ -792,11 +811,11 @@ async def set_card_holder(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Карта оновлена!</b>\n\n"
         f"<code>{config['card']}</code>\n"
-        f"<b>На ім'я:</b> {config['card_holder']}",
+        f"На ім'я: <b>{config['card_holder']}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_keyboard()
     )
-    await state.clear()
+    await state.set_state(OrderStates.admin_panel)
 
 @dp.message(F.text == "🎵 TikTok синхронізація")
 async def tiktok_sync(message: types.Message):
@@ -804,14 +823,14 @@ async def tiktok_sync(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     
-    await message.answer("🔄 Перевіряю нові видео на TikTok...", parse_mode=ParseMode.HTML)
+    await message.answer("🔄 Перевіряю нові відео на TikTok...", parse_mode=ParseMode.HTML)
     
     tiktok_count = await run_tiktok_sync()
     
     if tiktok_count:
-        result = f"✅ <b>Знайдено {tiktok_count} нових видео!</b>\n\nВони опубліковані в каналі {CHANNEL_ID} 🚀"
+        result = f"✅ <b>Знайдено {tiktok_count} нових відео!</b>\n\nВони опубліковані в каналі {CHANNEL_ID} 🚀"
     else:
-        result = "📪 <b>Нічого нового</b>. Всі актуальні видео вже опубліковані."
+        result = "📪 <b>Нічого нового</b>. Всі актуальні відео вже опубліковані."
     
     await message.answer(result, parse_mode=ParseMode.HTML)
 
@@ -842,6 +861,25 @@ async def auto_tiktok_loop():
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ============================================================
+# HEALTH CHECK ДЛЯ RENDER.COM
+# ============================================================
+def run_health_check():
+    """Запускає HTTP сервер для health check на Render.com"""
+    port = int(os.environ.get("PORT", 8080))
+
+    class SilentHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass  # Мовчимо в логах
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+    with socketserver.TCPServer(("", port), SilentHandler) as httpd:
+        logger.info(f"Health check сервер запущено на порту {port}")
+        httpd.serve_forever()
+
+# ============================================================
 # СТАРТ БОТА
 # ============================================================
 async def main():
@@ -849,18 +887,7 @@ async def main():
     asyncio.create_task(auto_tiktok_loop())
     await dp.start_polling(bot, skip_updates=True)
 
-    import http.server
-import socketserver
-import threading
-
-def run_health_check():
-    port = int(os.environ.get("PORT", 8080))
-    handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("", port), handler) as httpd:
-        httpd.serve_forever()
-
-# Запускаємо "пустушку" сервера в окремому потоці
-threading.Thread(target=run_health_check, daemon=True).start()
-
 if __name__ == "__main__":
+    # Запускаємо health check сервер у фоновому потоці
+    threading.Thread(target=run_health_check, daemon=True).start()
     asyncio.run(main())
