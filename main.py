@@ -2,6 +2,9 @@ import asyncio
 import os
 import json
 import logging
+import instaloader
+import requests
+import tempfile
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
@@ -14,10 +17,16 @@ from yt_dlp import YoutubeDL
 # ============================================================
 TOKEN = os.getenv("BOT_TOKEN", "8700486318:AAHnhE4UNKwQKPGT0ZlW-VPfX906z95heCE")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@rkperfume")
-ADMIN_ID = int(os.getenv("@pssuhh", "7443699603"))  # Ваш Telegram user_id (число)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7443699603"))  # Ваш Telegram user_id (число)
 
 INSTA_USER = "rk.perfume.krop"
 TIKTOK_USER = "rk.perfume.krop"
+
+# Instagram авторизація (обов'язково для отримання постів)
+# Задайте через змінні середовища або вставте напряму:
+INSTA_SESSION_FILE = os.getenv("INSTA_SESSION_FILE", "")  # шлях до файлу сесії Instaloader
+INSTA_LOGIN = os.getenv("INSTA_LOGIN", "rk.perfume.krop")                # логін Instagram (якщо немає session file)
+INSTA_PASSWORD = os.getenv("INSTA_PASSWORD", "20072006")          # пароль Instagram (якщо немає session file)
 
 CHECK_INTERVAL = 600  # секунд між автоперевірками (10 хв)
 STATE_FILE = "posts_state.json"
@@ -64,66 +73,112 @@ state = load_state()
 
 
 # ============================================================
-# ОТРИМАННЯ ПОСТІВ З INSTAGRAM (через yt-dlp, без логіну)
+# INSTALOADER — ініціалізація з авторизацією
+# ============================================================
+def create_instaloader() -> instaloader.Instaloader:
+    """Створює та авторизує екземпляр Instaloader."""
+    L = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        quiet=True,
+    )
+    if INSTA_SESSION_FILE and os.path.exists(INSTA_SESSION_FILE):
+        try:
+            L.load_session_from_file(INSTA_LOGIN, INSTA_SESSION_FILE)
+            logger.info("Instagram: сесія завантажена з файлу")
+        except Exception as e:
+            logger.warning(f"Не вдалося завантажити сесію: {e}")
+    elif INSTA_LOGIN and INSTA_PASSWORD:
+        try:
+            L.login(INSTA_LOGIN, INSTA_PASSWORD)
+            logger.info(f"Instagram: авторизація як {INSTA_LOGIN}")
+        except Exception as e:
+            logger.error(f"Instagram: помилка авторизації: {e}")
+    else:
+        logger.warning(
+            "Instagram: немає авторизації! "
+            "Задайте INSTA_SESSION_FILE або INSTA_LOGIN + INSTA_PASSWORD. "
+            "Без авторизації Instagram блокує запити."
+        )
+    return L
+
+
+# ============================================================
+# ОТРИМАННЯ ПОСТІВ З INSTAGRAM (через Instaloader з авторизацією)
 # ============================================================
 async def get_new_insta_posts() -> list:
     """Повертає список нових постів (відео або фото) з Instagram."""
-    url = f"https://www.instagram.com/{INSTA_USER}/"
-    ydl_opts = {
-        "quiet": True,
-        "extract_flat": "in_playlist",
-        "playlistend": 5,  # перевіряємо останні 5 постів
-        "no_warnings": True,
-    }
     new_posts = []
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info or "entries" not in info:
-                return []
-            for entry in info["entries"]:
-                post_id = entry.get("id", "")
-                if post_id and post_id not in state["published_insta"]:
-                    new_posts.append({
-                        "id": post_id,
-                        "url": entry.get("url") or f"https://www.instagram.com/p/{post_id}/",
-                        "webpage_url": f"https://www.instagram.com/p/{post_id}/",
-                        "title": entry.get("title", ""),
-                        "is_video": entry.get("_type") != "image",
-                    })
+        L = await asyncio.to_thread(create_instaloader)
+        profile = await asyncio.to_thread(
+            instaloader.Profile.from_username, L.context, INSTA_USER
+        )
+        posts_iter = profile.get_posts()
+        count = 0
+        for post in posts_iter:
+            if count >= 5:
+                break
+            post_id = post.shortcode
+            if post_id and post_id not in state["published_insta"]:
+                new_posts.append({
+                    "id": post_id,
+                    "webpage_url": f"https://www.instagram.com/p/{post_id}/",
+                    "title": post.caption[:200] if post.caption else "",
+                    "is_video": post.is_video,
+                    "media_url": post.video_url if post.is_video else post.url,
+                    "caption_raw": post.caption[:300] if post.caption else "",
+                    "post_obj": post,
+                })
+            count += 1
+    except instaloader.exceptions.LoginRequiredException:
+        logger.error(
+            "Instagram вимагає авторизацію! "
+            "Задайте INSTA_LOGIN + INSTA_PASSWORD або INSTA_SESSION_FILE."
+        )
+    except instaloader.exceptions.ProfileNotExistsException:
+        logger.error(f"Instagram профіль '{INSTA_USER}' не знайдено.")
     except Exception as e:
         logger.error(f"Instagram get_posts помилка: {e}")
     return new_posts
 
 
+def _download_media_url(url: str, dest_path: str) -> bool:
+    """Завантажує файл за URL у dest_path. Повертає True якщо успішно."""
+    try:
+        with requests.get(url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        return True
+    except Exception as e:
+        logger.warning(f"Помилка завантаження {url}: {e}")
+        return False
+
+
 async def download_insta_post(post: dict) -> dict:
     """Завантажує медіа конкретного Instagram поста."""
-    webpage_url = post["webpage_url"]
-    filename_base = f"insta_{post['id']}"
-    ydl_opts = {
-        "outtmpl": f"{filename_base}.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "format": "best[filesize<50M]/best",
-    }
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(webpage_url, download=True)
-            ext = info.get("ext", "mp4")
-            filename = f"{filename_base}.{ext}"
-            is_video = info.get("vcodec", "none") != "none"
-            caption_raw = info.get("description", info.get("title", ""))
-            return {
-                **post,
-                "filename": filename,
-                "is_video": is_video,
-                "caption_raw": caption_raw[:300] if caption_raw else "",
-                "ext": ext,
-            }
-    except Exception as e:
-        logger.warning(f"Не вдалося завантажити Instagram пост {post['id']}: {e}")
-        # Повертаємо без файлу — публікуємо лише посилання
-        return {**post, "filename": None, "caption_raw": post.get("title", ""), "is_video": False}
+    post_obj = post.get("post_obj")
+    if post_obj is None:
+        return {**post, "filename": None}
+
+    ext = "mp4" if post["is_video"] else "jpg"
+    filename = f"insta_{post['id']}.{ext}"
+    media_url = post.get("media_url", "")
+
+    if media_url:
+        ok = await asyncio.to_thread(_download_media_url, media_url, filename)
+        if ok and os.path.exists(filename):
+            return {**post, "filename": filename, "ext": ext}
+
+    # Fallback: публікуємо лише посилання
+    logger.warning(f"Не вдалося завантажити Instagram пост {post['id']}, публікуємо посилання")
+    return {**post, "filename": None}
 
 
 # ============================================================
