@@ -1,11 +1,28 @@
 import os
 import asyncio
 import yt_dlp
+from threading import Thread
+from flask import Flask
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
 
-# Твої дані
+# --- СЕКЦІЯ ДЛЯ RENDER (KEEP ALIVE) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_web():
+    # Render передає порт автоматично
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_web)
+    t.start()
+# ---------------------------------------
+
 TOKEN = "8700486318:AAHnhE4UNKwQKPGT0ZlW-VPfX906z95heCE"
 CHANNEL_ID = "@rkperfume"
 TIKTOK_PROFILE = "https://www.tiktok.com/@rk.perfume.krop"
@@ -18,6 +35,7 @@ def download_tiktok(url):
         'format': 'bestvideo+bestaudio/best',
         'outtmpl': 'video.mp4',
         'quiet': True,
+        'no_warnings': True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -25,7 +43,7 @@ def download_tiktok(url):
 
 @dp.message()
 async def handle_message(message: types.Message):
-    if "tiktok.com" in message.text:
+    if message.text and "tiktok.com" in message.text:
         status_msg = await message.answer("Зачекай, завантажую відео... ⏳")
         try:
             description, file_path = download_tiktok(message.text)
@@ -45,11 +63,15 @@ async def handle_message(message: types.Message):
                 )
             
             await status_msg.edit_text("✅ Відео опубліковано в каналі!")
-            os.remove(file_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
         except Exception as e:
             await status_msg.edit_text(f"❌ Помилка: {e}")
 
 async def main():
+    # ЗАПУСКАЄМО ВЕБ-СЕРВЕР ПЕРЕД БОТОМ
+    keep_alive() 
+    print("Web server started, starting bot polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
