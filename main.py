@@ -7,34 +7,37 @@ from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- НАЛАШТУВАННЯ ---
 TOKEN = "8700486318:AAHnhE4UNKwQKPGT0ZlW-VPfX906z95heCE"
 CHANNEL_ID = "@rkperfume"
 TIKTOK_PROFILE = "https://www.tiktok.com/@rk.perfume.krop"
 ADMIN_ID = 7443699603 
-ID_FILE = "last_video_id.txt"
-CHECK_INTERVAL = 300  # 5 хвилин
+HISTORY_FILE = "history.txt" # Зберігаємо список ID
+CHECK_INTERVAL = 300 
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- РОБОТА З ФАЙЛОМ ---
-def get_last_id():
-    if os.path.exists(ID_FILE):
-        with open(ID_FILE, "r") as f:
-            return f.read().strip()
-    return None
+# --- РОБОТА З ІСТОРІЄЮ ---
+def get_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r") as f:
+            return f.read().splitlines()
+    return []
 
-def save_last_id(video_id):
-    with open(ID_FILE, "w") as f:
-        f.write(str(video_id))
+def save_to_history(video_id):
+    history = get_history()
+    history.append(video_id)
+    # Зберігаємо тільки останні 20 записів, щоб файл не розростався
+    with open(HISTORY_FILE, "w") as f:
+        f.write("\n".join(history[-20:]))
 
 # --- ВЕБ-СЕРВЕР ---
 app = Flask('')
 @app.route('/')
-def home(): return "Бот активний!"
+def home(): return "Бот на варті контенту! 🔥"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -43,132 +46,123 @@ def run_web():
 def keep_alive():
     Thread(target=run_web, daemon=True).start()
 
-# --- ЛОГІКА ПОСТИНГУ ---
-async def download_and_send(video_url, desc, is_manual=False):
+# --- ФУНКЦІЯ ПУБЛІКАЦІЇ ---
+async def download_and_send(video_url, desc):
     file_name = f"video_{uuid.uuid4().hex[:8]}.mp4"
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': file_name,
         'quiet': True,
         'no_warnings': True,
+        'referer': 'https://www.tiktok.com/',
     }
     
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([video_url]))
         
-        # Оновлений підпис із посиланням на конкретне відео
         caption = (
-            f"🎬 <b>Подивіться це відео</b>\n\n"
+            f"✨ <b>ПОДИВІТЬСЯ ЦЕ ВІДЕО</b>\n"
+            f"────────────────────\n\n"
             f"📝 {desc}\n\n"
-            f"🔗 <a href='{video_url}'><b>Посилання на відео</b></a>\n"
-            f"👤 <a href='{TIKTOK_PROFILE}'><b>Наш TikTok профіль</b></a>"
+            f"💎 <i>Свіжий контент для вас</i>"
         )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎬 Дивитись в TikTok", url=video_url)],
+            [InlineKeyboardButton(text="👤 Наш профіль", url=TIKTOK_PROFILE)]
+        ])
 
         with open(file_name, 'rb') as video:
             await bot.send_video(
                 chat_id=CHANNEL_ID,
                 video=types.BufferedInputFile(video.read(), filename="video.mp4"),
                 caption=caption,
+                reply_markup=kb,
                 parse_mode=ParseMode.HTML
             )
         return True
     except Exception as e:
-        print(f"Помилка завантаження: {e}")
+        print(f"Помилка: {e}")
         return False
     finally:
         if os.path.exists(file_name):
             os.remove(file_name)
 
-async def check_and_post(count=1):
+# --- ЧІТКА ПЕРЕВІРКА ---
+async def smart_check(limit=5):
+    """Шукає нові відео серед останніх 'limit' публікацій"""
     ydl_opts = {'extract_flat': True, 'quiet': True}
+    new_count = 0
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, lambda: ydl.extract_info(TIKTOK_PROFILE, download=False))
             
-            if 'entries' in result and len(result['entries']) > 0:
-                entries_to_post = result['entries'][:count]
-                entries_to_post.reverse() 
+            if 'entries' in result:
+                # Беремо останні limit відео
+                latest_entries = result['entries'][:limit]
+                # Розвертаємо, щоб публікувати від старіших до найновіших
+                latest_entries.reverse()
                 
-                last_saved = get_last_id()
-                new_videos_found = 0
-
-                for entry in entries_to_post:
+                history = get_history()
+                
+                for entry in latest_entries:
                     v_id = entry['id']
-                    if v_id != last_saved:
+                    if v_id not in history:
+                        print(f"Знайдено нове відео: {v_id}")
                         success = await download_and_send(entry['url'], entry.get('title', 'Без опису'))
                         if success:
-                            save_last_id(v_id)
-                            last_saved = v_id
-                            new_videos_found += 1
-                            await asyncio.sleep(2)
-                
-                return new_videos_found
+                            save_to_history(v_id)
+                            new_count += 1
+                            await asyncio.sleep(5) # Пауза, щоб Telegram не спамив
     except Exception as e:
         print(f"Помилка моніторингу: {e}")
-    return 0
+    return new_count
 
 # --- ОБРОБНИКИ ---
-
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
-    
     kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Запостити останнє")],
-            [KeyboardButton(text="Останні 2"), KeyboardButton(text="Останні 3")]
-        ],
+        keyboard=[[KeyboardButton(text="🚀 Перевірити TikTok зараз")]],
         resize_keyboard=True
     )
-    await message.answer("Бот готовий. Вибери кількість відео для посту або просто скинь посилання на відео!", reply_markup=kb)
+    await message.answer("<b>Бот у режимі чіткого моніторингу!</b>", reply_markup=kb, parse_mode=ParseMode.HTML)
+
+@dp.message(F.text == "🚀 Перевірити TikTok зараз")
+async def manual_check(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    msg = await message.answer("🔍 Сканую останні відео...")
+    found = await smart_check(limit=5)
+    await msg.edit_text(f"✅ Перевірку завершено. Опубліковано нових: {found}")
 
 @dp.message(F.text.contains("tiktok.com"))
 async def manual_link(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     url = message.text.strip()
-    msg = await message.answer("Обробляю посилання... 📥")
-    
+    msg = await message.answer("📥 Завантажую за посиланням...")
     with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            if await download_and_send(url, info.get('title', 'Без опису'), is_manual=True):
-                await msg.edit_text("Відео успішно опубліковано! 🚀")
-            else:
-                await msg.edit_text("Не вдалося завантажити відео. ❌")
-        except Exception as e:
-            await msg.edit_text(f"Помилка: {e}")
+        info = ydl.extract_info(url, download=False)
+        if await download_and_send(url, info.get('title', 'Без опису')):
+            # Додаємо в історію, щоб авто-чек не дублював
+            save_to_history(info.get('id'))
+            await msg.edit_text("✅ Опубліковано!")
+        else:
+            await msg.edit_text("❌ Помилка.")
 
-@dp.message(F.text == "Запостити останнє")
-async def post_one(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer("Перевіряю TikTok... ⏳")
-    count = await check_and_post(1)
-    await message.answer(f"Готово! Опубліковано {count} відео.")
-
-@dp.message(F.text == "Останні 2")
-async def post_two(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer("Завантажую останні 2 відео... ⏳")
-    count = await check_and_post(2)
-    await message.answer(f"Готово! Опубліковано {count} відео.")
-
-@dp.message(F.text == "Останні 3")
-async def post_three(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer("Завантажую останні 3 відео... ⏳")
-    count = await check_and_post(3)
-    await message.answer(f"Готово! Опубліковано {count} відео.")
-
-# --- ЦИКЛИ ---
-
+# --- ЦИКЛ ---
 async def auto_check_loop():
-    # Перша перевірка при запуску
-    await check_and_post(1)
+    # При першому запуску просто записуємо поточні відео в історію, 
+    # щоб не спамити старим контентом, або публікуємо лише 1 найновіше.
+    history = get_history()
+    if not history:
+        print("Перший запуск. Наповнюю історію...")
+        await smart_check(limit=1) 
+    
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
-        await check_and_post(1)
+        await smart_check(limit=5)
 
 async def main():
     keep_alive()
