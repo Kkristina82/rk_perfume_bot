@@ -1,6 +1,7 @@
 import os
 import asyncio
 import yt_dlp
+import uuid
 from threading import Thread
 from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
@@ -13,12 +14,13 @@ TOKEN = "8700486318:AAHnhE4UNKwQKPGT0ZlW-VPfX906z95heCE"
 CHANNEL_ID = "@rkperfume"
 TIKTOK_PROFILE = "https://www.tiktok.com/@rk.perfume.krop"
 ADMIN_ID = 7443699603 
-ID_FILE = "last_video_id.txt"  # Файл для збереження ID останнього відео
+ID_FILE = "last_video_id.txt"
+CHECK_INTERVAL = 300  # Перевірка кожні 5 хвилин (300 секунд)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- РОБОТА З ЛОКАЛЬНИМ ФАЙЛОМ ---
+# --- ДОПОМІЖНІ ФУНКЦІЇ ---
 def get_last_id():
     if os.path.exists(ID_FILE):
         with open(ID_FILE, "r") as f:
@@ -29,10 +31,10 @@ def save_last_id(video_id):
     with open(ID_FILE, "w") as f:
         f.write(str(video_id))
 
-# --- СЕКЦІЯ KEEP ALIVE (ДЛЯ RENDER/REPLIT) ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 app = Flask('')
 @app.route('/')
-def home(): return "Bot is running!"
+def home(): return "Бот активний!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -41,27 +43,27 @@ def run_web():
 def keep_alive():
     Thread(target=run_web, daemon=True).start()
 
-# --- ЛОГІКА ЗАВАНТАЖЕННЯ ТА ПОСТИНГУ ---
-async def post_and_notify(video_url, v_id, desc):
-    file_name = f'video_{v_id}.mp4'
-    # Налаштування для завантаження саме відео файлу
+# --- ЛОГІКА ПОСТИНГУ ---
+async def download_and_send(video_url, desc, is_manual=False):
+    file_name = f"video_{uuid.uuid4().hex[:8]}.mp4"
+    
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': file_name,
-        'quiet': True
+        'quiet': True,
+        'no_warnings': True,
     }
     
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([video_url]))
         
         caption = (
-            f"🌟 <b>Нова публікація в TikTok</b>\n\n"
+            f"🎬 <b>Подивіться це відео</b>\n\n"
             f"📝 {desc}\n\n"
-            f"👤 <a href='{TIKTOK_PROFILE}'><b>Наш профіль</b></a>"
+            f"👤 <a href='{TIKTOK_PROFILE}'><b>Наш TikTok</b></a>"
         )
 
-        # Публікація в канал
         with open(file_name, 'rb') as video:
             await bot.send_video(
                 chat_id=CHANNEL_ID,
@@ -70,64 +72,81 @@ async def post_and_notify(video_url, v_id, desc):
                 parse_mode=ParseMode.HTML
             )
         
-        # Звіт адміну
-        await bot.send_message(ADMIN_ID, f"✅ Опубліковано: {video_url}")
-        
-        # Оновлюємо ID тільки після успішної публікації
-        save_last_id(v_id)
+        await bot.send_message(ADMIN_ID, f"✅ Відео опубліковано{' (вручну)' if is_manual else ''}!")
+        return True
 
     except Exception as e:
-        print(f"Помилка публікації: {e}")
-        await bot.send_message(ADMIN_ID, f"❌ Помилка при завантаженні: {e}")
+        print(f"Помилка: {e}")
+        return False
     
     finally:
         if os.path.exists(file_name):
             os.remove(file_name)
 
-async def check_tiktok():
+async def check_and_post_latest():
     ydl_opts = {'extract_flat': True, 'quiet': True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        result = ydl.extract_info(TIKTOK_PROFILE, download=False)
-        if 'entries' in result and len(result['entries']) > 0:
-            latest = result['entries'][0]
-            v_id = latest['id']
-            url = latest['url']
-            desc = latest.get('title', 'Без опису')
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Використовуємо loop для асинхронності
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: ydl.extract_info(TIKTOK_PROFILE, download=False))
             
-            if v_id != get_last_id():
-                await post_and_notify(url, v_id, desc)
-                return True
+            if 'entries' in result and len(result['entries']) > 0:
+                latest = result['entries'][0]
+                v_id = latest['id']
+                
+                if v_id != get_last_id():
+                    success = await download_and_send(latest['url'], latest.get('title', 'Без опису'))
+                    if success:
+                        save_last_id(v_id)
+                        return True
+    except Exception as e:
+        print(f"Помилка моніторингу: {e}")
     return False
 
-# --- ОБРОБНИКИ КОМАНД ---
+# --- ОБРОБНИКИ ---
+
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔍 Перевірити TikTok")]],
-        resize_keyboard=True
-    )
-    await message.answer(f"Бот працює. Останній збережений ID: {get_last_id()}", reply_markup=kb)
+    if message.from_user.id != ADMIN_ID: return
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Перевірити зараз")]], resize_keyboard=True)
+    await message.answer("Бот запущений! Надсилай посилання або чекай авто-постів.", reply_markup=kb)
 
-@dp.message(F.text == "🔍 Перевірити TikTok")
+@dp.message(F.text.contains("tiktok.com"))
+async def manual_link(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    url = message.text.strip()
+    msg = await message.answer("Завантажую... 📥")
+    
+    with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if await download_and_send(url, info.get('title', 'Без опису'), is_manual=True):
+            await msg.edit_text("Готово! 🚀")
+        else:
+            await msg.edit_text("Сталася помилка. ❌")
+
+@dp.message(F.text == "🔍 Перевірити зараз")
 async def manual_check(message: types.Message):
-    await message.answer("Шукаю нові відео... ⏳")
-    found = await check_tiktok()
-    if not found:
-        await message.answer("Нових відео не знайдено. ✅")
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer("Шукаю нове... ⏳")
+    if not await check_and_post_latest():
+        await message.answer("Нових відео немає. ✅")
+
+# --- ЦИКЛ ТА ЗАПУСК ---
 
 async def auto_check_loop():
+    # Перша перевірка відразу при підключенні
+    print("Виконую першу перевірку...")
+    await check_and_post_latest()
+    
     while True:
-        try:
-            await check_tiktok()
-        except Exception as e:
-            print(f"Помилка в циклі: {e}")
-        await asyncio.sleep(1800) # Перевірка кожні 30 хвилин
+        await asyncio.sleep(CHECK_INTERVAL)
+        await check_and_post_latest()
 
 async def main():
     keep_alive()
-    # Запускаємо фонову перевірку
+    # Запускаємо цикл як окрему задачу
     asyncio.create_task(auto_check_loop())
-    # Запускаємо бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
