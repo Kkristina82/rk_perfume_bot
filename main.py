@@ -1,7 +1,7 @@
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-API_TOKEN = 'ВАШ_ТОКЕН_З_BOTFATHER'
+API_TOKEN = '8700486318:AAHnhE4UNKwQKPGT0ZlW-VPfX906z95heCE'
 CHANNEL_ID = '@rkperfume'
 TIKTOK_PROFILE_URL = 'https://www.tiktok.com/@rk.perfume.krop'
 
