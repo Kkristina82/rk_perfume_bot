@@ -1,4 +1,3 @@
 aiogram
 yt-dlp
-firebase-admin
-aiohttp
+flask
