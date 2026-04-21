@@ -3,129 +3,133 @@ import asyncio
 import yt_dlp
 import firebase_admin
 from firebase_admin import credentials, db
-from threading import Thread
-from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
+from aiohttp import web
 
-# --- ІНІЦІАЛІЗАЦІЯ FIREBASE ---
-FIREBASE_URL = "https://rkbot-db5d6-default-rtdb.firebaseio.com/"
-
-cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred, {
-    'databaseURL': FIREBASE_URL
-})
-
-db_last_video = db.reference('last_video_id')
-
-# --- НАЛАШТУВАННЯ БОТА ---
+# --- КОНФІГУРАЦІЯ ---
 TOKEN = "8700486318:AAHnhE4UNKwQKPGT0ZlW-VPfX906z95heCE"
 CHANNEL_ID = "@rkperfume"
 TIKTOK_PROFILE = "https://www.tiktok.com/@rk.perfume.krop"
+ADMIN_ID = 7443699603
+FIREBASE_URL = "https://rkbot-db5d6-default-rtdb.firebaseio.com/"
 
-# ВАШ КОНКРЕТНИЙ ID ДЛЯ ЗВІТІВ
-ADMIN_ID = 7443699603 
+# Ініціалізація Firebase
+if not firebase_admin._apps:
+    cred = credentials.Certificate("serviceAccountKey.json")
+    firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_URL})
+
+db_last_video = db.reference('last_video_id')
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- СЕКЦІЯ RENDER / FLASK ---
-app = Flask('')
-@app.route('/')
-def home(): return "Bot is running!"
+# --- ЛОГІКА ТІКТОК ---
+def get_tiktok_data():
+    ydl_opts = {
+        'extract_flat': True, 
+        'quiet': True, 
+        'no_warnings': True,
+        'playlist_items': '1'
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        result = ydl.extract_info(TIKTOK_PROFILE, download=False)
+        if 'entries' in result and len(result['entries']) > 0:
+            return result['entries'][0]
+    return None
 
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    Thread(target=run_web).start()
-
-# --- ЛОГІКА ТА ОБРОБНИКИ ---
+async def download_video(url):
+    """Завантажує відео в пам'ять (без створення файлу на диску)"""
+    file_path = "temp_video.mp4"
+    ydl_opts = {
+        'format': 'bestvideo+bestaudio/best',
+        'outtmpl': file_path,
+        'quiet': True
+    }
+    # Використовуємо run_in_executor для блокуючої операції yt_dlp
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([url]))
+    
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        os.remove(file_path)
+        return data
+    return None
 
 async def post_and_notify(video_url, v_id, desc):
-    file_name = 'temp_video.mp4'
-    ydl_opts = {'format': 'bestvideo+bestaudio/best', 'outtmpl': file_name, 'quiet': True}
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
-    
+    video_data = await download_video(video_url)
+    if not video_data:
+        return
+
     caption = (
         f"🌟 <b>Нова публікація в TikTok</b>\n\n"
         f"📝 {desc}\n\n"
         f"👤 <a href='{TIKTOK_PROFILE}'><b>Наш профіль</b></a>"
     )
 
-    # 1. Публікація в канал
-    with open(file_name, 'rb') as video:
+    try:
+        # Публікація в канал
         await bot.send_video(
             chat_id=CHANNEL_ID,
-            video=types.BufferedInputFile(video.read(), filename="video.mp4"),
+            video=BufferedInputFile(video_data, filename="video.mp4"),
             caption=caption,
             parse_mode=ParseMode.HTML
         )
-    
-    # 2. Відправка звіту на ваш ID
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_ID, 
-            text=f"✅ <b>Відео успішно опубліковано!</b>\n🔗 {video_url}",
-            parse_mode=ParseMode.HTML
-        )
+        # Звіт адміну
+        await bot.send_message(ADMIN_ID, f"✅ Опубліковано: {video_url}")
     except Exception as e:
-        print(f"Помилка відправки звіту на {ADMIN_ID}: {e}")
+        print(f"Error posting: {e}")
 
-    if os.path.exists(file_name):
-        os.remove(file_name)
-
+# --- ОБРОБНИКИ КОМАНД ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔍 Перевірити останні пости")]],
+        keyboard=[[KeyboardButton(text="🔍 Перевірити TikTok")]],
         resize_keyboard=True
     )
-    await message.answer(f"Привіт! Звіти будуть приходити на ID: {ADMIN_ID}", reply_markup=kb)
+    await message.answer(f"Бот працює. Звіти для: {ADMIN_ID}", reply_markup=kb)
 
-@dp.message(F.text == "🔍 Перевірити останні пости")
+@dp.message(F.text == "🔍 Перевірити TikTok")
 async def manual_check(message: types.Message):
-    status = await message.answer("Перевіряю TikTok... ⏳")
-    
-    # Отримання даних через yt-dlp
-    ydl_opts = {'extract_flat': True, 'quiet': True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        result = ydl.extract_info(TIKTOK_PROFILE, download=False)
-        if 'entries' in result and len(result['entries']) > 0:
-            latest = result['entries'][0]
-            url, v_id, desc = latest['url'], latest['id'], latest.get('title', 'Без опису')
-            
-            if v_id != db_last_video.get():
-                await post_and_notify(url, v_id, desc)
-                db_last_video.set(v_id)
-                await status.edit_text("Знайдено нове відео! Опубліковано. 🚀")
-            else:
-                await status.edit_text("Нових відео поки немає. ✅")
+    msg = await message.answer("Перевіряю... ⏳")
+    latest = get_tiktok_data()
+    if latest and latest['id'] != db_last_video.get():
+        await post_and_notify(latest['url'], latest['id'], latest.get('title', 'Без опису'))
+        db_last_video.set(latest['id'])
+        await msg.edit_text("Знайдено та опубліковано! 🚀")
+    else:
+        await msg.edit_text("Нових відео немає. ✅")
 
+# --- ФОНОВА ПЕРЕВІРКА ---
 async def auto_check_loop():
     while True:
         try:
-            ydl_opts = {'extract_flat': True, 'quiet': True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(TIKTOK_PROFILE, download=False)
-                if 'entries' in result and len(result['entries']) > 0:
-                    latest = result['entries'][0]
-                    v_id = latest['id']
-                    if v_id != db_last_video.get():
-                        await post_and_notify(latest['url'], v_id, latest.get('title', 'Без опису'))
-                        db_last_video.set(v_id)
+            latest = get_tiktok_data()
+            if latest and latest['id'] != db_last_video.get():
+                await post_and_notify(latest['url'], latest['id'], latest.get('title', 'Без опису'))
+                db_last_video.set(latest['id'])
         except Exception as e:
-            print(f"Цикл: {e}")
-        await asyncio.sleep(3600)
+            print(f"Loop error: {e}")
+        await asyncio.sleep(600) # Перевірка кожні 10 хвилин
+
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+async def handle(request):
+    return web.Response(text="Bot is alive!")
 
 async def main():
-    keep_alive()
+    # Налаштування веб-сервера aiohttp (замість Flask для кращої сумісності)
+    server = web.Application()
+    server.router.add_get('/', handle)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080)))
+    
+    asyncio.create_task(site.start())
     asyncio.create_task(auto_check_loop())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
